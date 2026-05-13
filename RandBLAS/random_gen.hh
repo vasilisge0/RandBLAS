@@ -38,6 +38,33 @@
 #include <Random123/threefry.h>
 // NOTE: we do not support Random123's AES or ARS generators.
 
+// Host-side shim for sincospi / sincospif. Random123/boxmuller.hpp calls these
+// unqualified; its own fallback definitions are gated behind
+//     `!defined(CUDART_VERSION) || CUDART_VERSION < 5000`
+// and are therefore skipped on host compiles where any dependency leaks
+// <cuda_runtime.h> into the include chain (notably blaspp's CMake config
+// transitively exports CUDA_INCLUDE_DIRS when blaspp was built with CUDA
+// support, which then poisons RandBLAS's host test compiles). Without these
+// definitions the host-compiled code fails to link.
+//
+// An earlier version of this shim was removed in PR #156 (9b73a25, 2026-03-05)
+// on the theory that CI green = unused. RandBLAS CI does not currently
+// exercise the Linux + CUDA-aware blaspp configuration where the failure
+// manifests; restoring the shim so host builds succeed on that config.
+#if !defined(__CUDACC__)
+#include <cmath>
+static inline void sincospif(float x, float *s, float *c) {
+    const float PIf = 3.1415926535897932f;
+    *s = std::sin(PIf * x);
+    *c = std::cos(PIf * x);
+}
+static inline void sincospi(double x, double *s, double *c) {
+    const double PI = 3.1415926535897932;
+    *s = std::sin(PI * x);
+    *c = std::cos(PI * x);
+}
+#endif
+
 #include <Random123/boxmuller.hpp>
 #include <Random123/uniform.hpp>
 
