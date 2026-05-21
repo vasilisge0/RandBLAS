@@ -50,7 +50,7 @@ make -j install
 One can install Random123 from
 [source](https://github.com/DEShawResearch/random123) by running
 ```shell
-git clone git@github.com:DEShawResearch/random123.git
+git clone https://github.com/DEShawResearch/random123.git
 cd random123/
 make prefix=`pwd`/../random123-install install-include
 ```
@@ -87,7 +87,7 @@ Assuming you used the recipes from Section 1 to get RandBLAS' dependencies,
 you can download, build, and install RandBLAS as follows:
 
 ```shell
-git clone git@github.com:BallisticLA/RandBLAS.git
+git clone https://github.com/BallisticLA/RandBLAS.git
 mkdir RandBLAS-build
 cd RandBLAS-build
 cmake -DCMAKE_BUILD_TYPE=Release \
