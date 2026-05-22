@@ -32,6 +32,8 @@
 #include "RandBLAS/exceptions.hh"
 #include "RandBLAS/random_gen.hh"
 #include "RandBLAS/util.hh"
+#include "RandBLAS/device.hh"
+#include "RandBLAS/precision.hh"
 
 #include <blas.hh>
 
@@ -40,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <array>
 
 #include <cmath>
 #include <typeinfo>
@@ -385,6 +388,12 @@ struct DenseSkOp {
     ///  operator.
     const state_t next_state;
 
+    const Device device;
+
+    // used for dynamic dispatch of
+    // @FIX: should be const eventually.
+    std::array<NumericType, 2> precisions;
+
     // ---------------------------------------------------------------------------
     ///  Alias for dist.n_rows.
     const int64_t n_rows;
@@ -450,7 +459,18 @@ struct DenseSkOp {
         own_memory(true),
         // ^ We won't take advantage of own_memory unless this is passed to fill_dense(S).
         buff(nullptr),
-        layout(dist.natural_layout) { }
+        layout(dist.natural_layout),
+        device(RandBLAS::Device::CPU)
+        {
+            if constexpr (std::is_same<T, double>::value) {
+                precisions = {RandBLAS::NumericType::FP64, RandBLAS::NumericType::FP64};
+            }
+            else if constexpr (std::is_same<T, float>::value) {
+                precisions = {RandBLAS::NumericType::FP32, RandBLAS::NumericType::FP32};
+            } else {
+                precisions = {RandBLAS::NumericType::FP16, RandBLAS::NumericType::FP16};
+            }
+        }
 
     //  Move constructor
     DenseSkOp(
@@ -460,7 +480,8 @@ struct DenseSkOp {
         seed_state(S.seed_state),
         next_state(S.next_state),
         n_rows(dist.n_rows), n_cols(dist.n_cols),
-        own_memory(S.own_memory), buff(S.buff), layout(S.layout)
+        own_memory(S.own_memory), buff(S.buff), layout(S.layout),
+        device(S.device), precisions(S.precisions)
     {   // Body
         S.buff = nullptr;
         // ^ Our memory management policy prohibits us from changing

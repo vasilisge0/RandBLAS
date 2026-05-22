@@ -33,6 +33,9 @@
 #include "RandBLAS/random_gen.hh"
 #include "RandBLAS/dense_skops.hh"
 #include "RandBLAS/sparse_skops.hh"
+#include "RandBLAS/precision.hh"
+#include "RandBLAS/device.hh"
+#include "RandBLAS/matrix.hh"
 
 #include <iostream>
 #include <stdio.h>
@@ -1198,5 +1201,25 @@ inline void sketch_general(
     }
     return sketch_general(layout, opA, opS, m, d, n, alpha, A, lda, S, 0, 0, beta, B, ldb);
 };
+
+// @NEW: A new API call for sketch_general; objects A and B should be passed as a matrix type that allows for dynamic dispatch of the correct sketch apply call depending on the backend device, compute and store types.
+// template <SketchingOperator SKOP>
+// inline void sketch_general(
+//     blas::Layout layout,
+//     blas::Op opA,
+//     blas::Op opS,
+//     int64_t m, // B is m-by-d
+//     int64_t d, // op(submat(\mtxS)) is n-by-d
+//     int64_t n, // op(A) is m-by-n
+//     double alpha,   // pass alpah and beta as double to simplify API; the apply call will cast to the correct compute type as needed.
+//     const Matrix& A,
+//     int64_t lda,
+//     const SKOP &S,
+//     int64_t ro_s,
+//     int64_t co_s,
+//     const Matrix& A,
+//     int64_t ldb
+// );
+
 
 }  // end namespace RandBLAS
