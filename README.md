@@ -19,10 +19,11 @@ Detailed installation instructions are in [INSTALL.md](INSTALL.md).
 
 ### Continuous integration builds
 
-![Latest Ubuntu (OpenMP)](https://github.com/BallisticLA/RandBLAS/actions/workflows/core-linux.yaml/badge.svg)
-![Latest macOS (serial)](https://github.com/BallisticLA/RandBLAS/actions/workflows/core-macos.yml/badge.svg)
-![Latest macOS (OpenMP)](https://github.com/BallisticLA/RandBLAS/actions/workflows/openmp-macos.yaml/badge.svg)
-![Old macOS (OpenMP)](https://github.com/BallisticLA/RandBLAS/actions/workflows/openmp-macos-13.yaml/badge.svg)
+![core](https://github.com/BallisticLA/RandBLAS/actions/workflows/core.yml/badge.svg)
+![thread-sanitizer](https://github.com/BallisticLA/RandBLAS/actions/workflows/thread-sanitizer.yml/badge.svg)
+![examples](https://github.com/BallisticLA/RandBLAS/actions/workflows/examples.yml/badge.svg)
+![downstream-consumer](https://github.com/BallisticLA/RandBLAS/actions/workflows/downstream-consumer.yml/badge.svg)
+![docs](https://github.com/BallisticLA/RandBLAS/actions/workflows/docs.yml/badge.svg)
 
 ### Copyright and license
 
