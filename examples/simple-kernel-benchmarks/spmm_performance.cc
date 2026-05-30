@@ -4,39 +4,52 @@
 // SPARSE-DENSE MATRIX MULTIPLICATION PERFORMANCE BENCHMARK
 // ============================================================================
 //
-// This benchmark answers four questions about RandBLAS SpMM performance:
+// Benchmarks the RandBLAS left_spmm kernels (C = A*B, with A sparse) across the
+// three sparse formats (CSR, CSC, COO) and BOTH dense-matrix layouts
+// (ColMajor, RowMajor). Driving left_spmm with both layouts is enough to
+// exercise every hand-rolled SpMM kernel, because the dispatch
+// (spmm_dispatch.hh) selects the kernel purely from (layout_opB, layout_C):
 //
-//   1. Which sparse format is best for left SpMM (B = S*A)?
-//      -> CSR, CSC, and COO are compared; CSR and COO (via MKL) tend to win.
+//   ColMajor dense -> apply_csr_jik_p11          / apply_csc_jki_p11
+//   RowMajor dense -> apply_csr_ikb_p1b_rowmajor / apply_csc_kib_1p1_rowmajor
+//   (COO delegates to the CSC kernels in both layouts, via apply_coo_via_csc)
 //
-//   2. Which sparse format is best for right SpMM (B = A*S)?
-//      -> CSC wins, because the dispatch transposes CSC to CSR and uses MKL
-//         with SPARSE_OPERATION_NON_TRANSPOSE — the fastest MKL path.
+// A fourth combination -- op(B)=Trans (computing C = A * B^T, the dense operand
+// fed transposed) -- also routes to apply_csr_jik_p11 / apply_csc_jki_p11, but
+// with a STRIDED dense access (gather when C is ColMajor, strided store when C
+// is RowMajor) rather than the unit-stride NoTrans ColMajor pattern. MKL
+// declines op(B)=Trans, so it is hand-rolled even on MKL builds.
 //
-//   3. How much does MKL accelerate SpMM over hand-rolled kernels?
-//      -> For left SpMM, the benchmark runs CSR through both MKL and the
-//         hand-rolled kernel on the same data, giving a direct speedup ratio.
+// These are exactly the kernels that left_spmm and right_spmm TOGETHER reach.
+// right_spmm reduces to left_spmm by transposing the sparse operand (CSR<->CSC
+// view) and flipping the layout, so the old "right CSR (ColMajor)" path runs
+// the very same kernel as "left RowMajor CSC" does here (and old "right CSC" ==
+// "left RowMajor CSR"). Benchmarking left_spmm directly in both layouts hits
+// the same kernels while measuring each one without the right_spmm wrapper.
 //
-//   4. Are left and right SpMM comparable in performance?
-//      -> The "SQUARE PROBLEMS" section uses d = m = n so both directions
-//         have identical FLOP counts and output sizes. A summary line after
-//         each config reports the best-of-each comparison.
+// This benchmark answers:
+//   1. Which sparse format is fastest, for each dense layout?
+//   2. ColMajor vs RowMajor: how much does the dense layout matter? RowMajor
+//      routes to the BLAS-axpy-based kernels; ColMajor routes to the scalar
+//      gather (CSR) / scatter (CSC) kernels.
+//   3. (MKL builds only) How much does MKL accelerate over the hand-rolled
+//      kernels? The ColMajor table runs CSR through both left_spmm (which uses
+//      MKL when available) and the hand-rolled kernel called directly. This is
+//      the one path that does NOT go through left_spmm -- on an MKL build the
+//      dispatch always picks MKL, so the hand-rolled kernel is otherwise
+//      unreachable. It compiles out entirely when MKL is disabled.
+//   4. op(B)=Trans (C = A * B^T): how much does the strided dense access cost
+//      relative to the unit-stride NoTrans path? Reported in two extra tables.
 //
-// NOTE: This benchmarks the SpMM kernel directly (left_spmm / right_spmm),
-// not sketch_general. Any overhead from SKOP generation or sketch_general's
-// internal dispatch is not captured here. In practice SpMM dominates the
-// cost, so these results are a good proxy for sketching performance.
+// NOTE: benchmarks the SpMM kernel directly, not sketch_general. SpMM dominates
+// sketching cost, so these results are a good proxy for sketching performance.
 //
 // NOTATION:
-//   S  - Sparse matrix (m x n)
-//   A  - Dense input matrix
-//   B  - Dense result matrix
-//
-//   Left SpMM:  B(m x d) = S(m x n) * A(n x d)
-//   Right SpMM: B(d x n) = A(d x m) * S(m x n)
-//
-//   A "densify + GEMM" reference converts S to dense and calls BLAS GEMM,
-//   reporting the densify and GEMM times separately.
+//   A - sparse (m x n),  B - dense (n x d),  C - dense result (m x d)
+//   left_spmm:  C(m x d) = A(m x n) * B(n x d)
+//   The same logical B (and hence result C) is stored in BOTH ColMajor and
+//   RowMajor, so the two layouts compute the identical product and are
+//   directly comparable.
 //
 // USAGE:
 //   ./spmm_performance                             # default sweep
@@ -44,8 +57,8 @@
 //
 //   Default sweep (no arguments):
 //     Two sections, 10 trials each:
-//       1. SQUARE (d = m = n): sizes 100..2000, fair left-vs-right comparison
-//       2. RECTANGULAR: square S with small d, tall S, wide S
+//       1. SQUARE (d = m = n): sizes 100..2000
+//       2. RECTANGULAR: square A with small d, tall A, wide A
 //
 //   Single config (4+ arguments):
 //     One (m, n, d, density) configuration, default 20 trials.
@@ -79,8 +92,10 @@ using blas::Layout;
 using blas::Op;
 
 // Calls the hand-rolled CSR left-multiply kernel directly, bypassing MKL.
-// Used to answer question 3 (MKL vs hand-rolled speedup). Replicates the
-// beta-scaling and kernel selection logic from spmm_dispatch.hh.
+// Used to answer question 3 (MKL vs hand-rolled speedup) on MKL builds, where
+// left_spmm would otherwise always pick MKL. Replicates the beta-scaling and
+// kernel selection logic from spmm_dispatch.hh. Here A is sparse (CSR), B is the
+// dense input, C is the dense result -- matching the left_spmm convention.
 template <typename T, typename sint_t>
 void handrolled_left_spmm_csr(
     blas::Layout layout, int64_t d, int64_t n, int64_t m,
@@ -169,156 +184,170 @@ void print_densify_row(const std::string& name, long total, long dens, long gemm
               << "  (densify " << dens << " + GEMM " << gemm << ")\n";
 }
 
-// Run one complete benchmark configuration: generate matrices, time all
-// format x direction combinations, verify correctness, and print results.
+void print_table_header(const std::string& title) {
+    std::cout << "  " << title << "\n";
+    std::cout << "  " << std::setw(24) << std::left << "Kernel"
+              << std::setw(10) << std::right << "Min (us)"
+              << std::setw(10) << "Med (us)"
+              << std::setw(11) << "vs best" << "\n";
+    std::cout << "  " << std::string(55, '-') << "\n";
+}
+
+// Run one complete benchmark configuration: generate matrices, time every
+// format x layout combination through left_spmm, verify correctness, print.
 void run_config(int64_t m, int64_t n, int64_t d, double density, int num_trials) {
     using T = double;
+    namespace rbsd = RandBLAS::sparse_data;
     uint64_t seed = 12345;
 
     // Header
     std::string shape;
     if (m == n && d == m) shape = "all square";
-    else if (m == n) shape = "square S";
+    else if (m == n) shape = "square A";
     else if (m > n) shape = "tall";
     else shape = "wide";
 
-    std::cout << "--- S(" << m << "x" << n << "), d=" << d
+    std::cout << "--- A(" << m << "x" << n << "), d=" << d
               << ", density=" << std::setprecision(4) << density << " (" << shape << ") ---\n";
 
     // Generate one random COO matrix and convert to CSR/CSC so all three
     // formats represent the identical mathematical matrix.
-    auto [S_coo, next_state] = RandBLAS::testing::random_coo<T>(m, n, density, RandBLAS::RNGState<>(seed));
-    auto S_csr = S_coo.as_owning_csr();
-    auto S_csc = S_coo.as_owning_csc();
+    auto [A_coo, next_state] = RandBLAS::testing::random_coo<T>(m, n, density, RandBLAS::RNGState<>(seed));
+    auto A_csr = A_coo.as_owning_csr();
+    auto A_csc = A_coo.as_owning_csc();
 
-    std::cout << "  nnz=" << S_coo.nnz << ", trials=" << num_trials << "\n\n";
+    std::cout << "  nnz=" << A_coo.nnz << ", trials=" << num_trials << "\n\n";
 
-    // Generate dense matrices
-    auto state = next_state;
-    std::vector<T> A_left(n * d);
-    RandBLAS::DenseDist D_left(n, d);
-    state = RandBLAS::fill_dense(D_left, A_left.data(), state);
+    // One logical dense B (n x d), stored in both layouts so the ColMajor and
+    // RowMajor runs compute the identical product C = A*B.
+    //   ColMajor: B(i,j) = B_cm[i + j*n]   (ldB = n)
+    //   RowMajor: B(i,j) = B_rm[i*d + j]   (ldB = d)
+    std::vector<T> B_cm(n * d);
+    RandBLAS::DenseDist DB(n, d);
+    RandBLAS::fill_dense(DB, B_cm.data(), next_state);
+    std::vector<T> B_rm(n * d);
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t j = 0; j < d; ++j)
+            B_rm[i*d + j] = B_cm[i + j*n];
 
-    std::vector<T> A_right(d * m);
-    RandBLAS::DenseDist D_right(d, m);
-    state = RandBLAS::fill_dense(D_right, A_right.data(), state);
+    // Result buffers (logical C is m x d in both layouts) and densify workspace.
+    std::vector<T> C_cm(m * d), C_rm(m * d);
+    std::vector<T> A_dense(m * n);
 
-    // Result and workspace buffers
-    std::vector<T> B_left(m * d);
-    std::vector<T> B_right(d * n);
-    std::vector<T> S_dense(m * n);
+    // Time left_spmm for one (format, layout): C = A * B, with B and C stored
+    // in `layout`. ldB / ldC follow from the layout (see notation above).
+    auto time_spmm = [&](const auto& A, Layout layout, std::vector<T>& C) {
+        const T* Bptr = (layout == Layout::ColMajor) ? B_cm.data() : B_rm.data();
+        int64_t ldB   = (layout == Layout::ColMajor) ? n : d;
+        int64_t ldC   = (layout == Layout::ColMajor) ? m : d;
+        return run_trials([&]() {
+            std::fill(C.begin(), C.end(), 0.0);
+            rbsd::left_spmm(layout, Op::NoTrans, Op::NoTrans, m, d, n,
+                            1.0, A, 0, 0, Bptr, ldB, 0.0, C.data(), ldC);
+        }, num_trials);
+    };
 
-    // ---- Left SpMM: B = S * A ----
-    auto [min_l_csr, med_l_csr] = run_trials([&]() {
-        std::fill(B_left.begin(), B_left.end(), 0.0);
-        RandBLAS::sparse_data::left_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-            m, d, n, 1.0, S_csr, 0, 0, A_left.data(), n, 0.0, B_left.data(), m);
-    }, num_trials);
+    // ---- ColMajor left_spmm (hits jik / jki kernels) ----
+    auto [min_cm_csr, med_cm_csr] = time_spmm(A_csr, Layout::ColMajor, C_cm);
+    auto [min_cm_csc, med_cm_csc] = time_spmm(A_csc, Layout::ColMajor, C_cm);
+    auto [min_cm_coo, med_cm_coo] = time_spmm(A_coo, Layout::ColMajor, C_cm);
 
-    // Hand-rolled CSR: same data as above, but bypasses MKL (question 3).
-    long min_l_csr_hr = 0, med_l_csr_hr = 0;
+    // Hand-rolled CSR ColMajor: bypasses MKL for the MKL-vs-hand-rolled
+    // comparison. This is the only path that does not go through left_spmm.
     #if defined(RandBLAS_HAS_MKL)
+    long min_cm_csr_hr = 0, med_cm_csr_hr = 0;
     {
         auto [mn, md] = run_trials([&]() {
-            std::fill(B_left.begin(), B_left.end(), 0.0);
+            std::fill(C_cm.begin(), C_cm.end(), 0.0);
             handrolled_left_spmm_csr(Layout::ColMajor, m, d, n, 1.0,
-                S_csr, A_left.data(), n, 0.0, B_left.data(), m);
+                A_csr, B_cm.data(), n, 0.0, C_cm.data(), m);
         }, num_trials);
-        min_l_csr_hr = mn;
-        med_l_csr_hr = md;
+        min_cm_csr_hr = mn;
+        med_cm_csr_hr = md;
     }
     #endif
 
-    auto [min_l_csc, med_l_csc] = run_trials([&]() {
-        std::fill(B_left.begin(), B_left.end(), 0.0);
-        RandBLAS::sparse_data::left_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-            m, d, n, 1.0, S_csc, 0, 0, A_left.data(), n, 0.0, B_left.data(), m);
-    }, num_trials);
+    // ---- RowMajor left_spmm (hits ikb / kib kernels; the paths the old
+    //      right_spmm section reached, via the CSR<->CSC transpose) ----
+    auto [min_rm_csr, med_rm_csr] = time_spmm(A_csr, Layout::RowMajor, C_rm);
+    auto [min_rm_csc, med_rm_csc] = time_spmm(A_csc, Layout::RowMajor, C_rm);
+    auto [min_rm_coo, med_rm_coo] = time_spmm(A_coo, Layout::RowMajor, C_rm);
 
-    auto [min_l_coo, med_l_coo] = run_trials([&]() {
-        std::fill(B_left.begin(), B_left.end(), 0.0);
-        RandBLAS::sparse_data::left_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-            m, d, n, 1.0, S_coo, 0, 0, A_left.data(), n, 0.0, B_left.data(), m);
-    }, num_trials);
-
-    // ---- Right SpMM: B = A * S ----
-    auto [min_r_csr, med_r_csr] = run_trials([&]() {
-        std::fill(B_right.begin(), B_right.end(), 0.0);
-        RandBLAS::sparse_data::right_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-            d, n, m, 1.0, A_right.data(), d, S_csr, 0, 0, 0.0, B_right.data(), d);
-    }, num_trials);
-
-    auto [min_r_csc, med_r_csc] = run_trials([&]() {
-        std::fill(B_right.begin(), B_right.end(), 0.0);
-        RandBLAS::sparse_data::right_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-            d, n, m, 1.0, A_right.data(), d, S_csc, 0, 0, 0.0, B_right.data(), d);
-    }, num_trials);
-
-    auto [min_r_coo, med_r_coo] = run_trials([&]() {
-        std::fill(B_right.begin(), B_right.end(), 0.0);
-        RandBLAS::sparse_data::right_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-            d, n, m, 1.0, A_right.data(), d, S_coo, 0, 0, 0.0, B_right.data(), d);
-    }, num_trials);
-
-    // ---- Reference: densify + GEMM ----
-    auto [min_dens, min_gemm_left] = run_split_trials(
-        [&]() { RandBLAS::sparse_data::csr::csr_to_dense(S_csr, Layout::ColMajor, S_dense.data()); },
-        [&]() {
-            std::fill(B_left.begin(), B_left.end(), 0.0);
-            blas::gemm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                       m, d, n, 1.0, S_dense.data(), m, A_left.data(), n, 0.0, B_left.data(), m);
+    // ---- Transposed dense (opB=Trans): C = A * B^T, dense operand fed
+    //      transposed so the SAME product A*B is computed. This routes to the
+    //      jik/jki kernels with a STRIDED dense access (incv != 1 when C is
+    //      ColMajor, incAv != 1 when C is RowMajor) -- distinct from the
+    //      unit-stride NoTrans ColMajor path, and the only sparse-NoTrans path
+    //      MKL declines (so it stays hand-rolled on MKL builds).
+    //      B^T (d x n) needs no new storage: the transpose of the ColMajor n-x-d
+    //      buffer IS the RowMajor buffer, so ColMajor-B^T == B_rm, RowMajor == B_cm.
+    auto time_spmm_t = [&](const auto& A, Layout layout, std::vector<T>& C) {
+        const T* BTptr = (layout == Layout::ColMajor) ? B_rm.data() : B_cm.data();
+        int64_t ldBT   = (layout == Layout::ColMajor) ? d : n;
+        int64_t ldC    = (layout == Layout::ColMajor) ? m : d;
+        return run_trials([&]() {
+            std::fill(C.begin(), C.end(), 0.0);
+            rbsd::left_spmm(layout, Op::NoTrans, Op::Trans, m, d, n,
+                            1.0, A, 0, 0, BTptr, ldBT, 0.0, C.data(), ldC);
         }, num_trials);
-    long min_ref_left = min_dens + min_gemm_left;
+    };
 
-    auto [min_dens2, min_gemm_right] = run_split_trials(
-        [&]() { RandBLAS::sparse_data::csr::csr_to_dense(S_csr, Layout::ColMajor, S_dense.data()); },
+    auto [min_tcm_csr, med_tcm_csr] = time_spmm_t(A_csr, Layout::ColMajor, C_cm);
+    auto [min_tcm_csc, med_tcm_csc] = time_spmm_t(A_csc, Layout::ColMajor, C_cm);
+    auto [min_tcm_coo, med_tcm_coo] = time_spmm_t(A_coo, Layout::ColMajor, C_cm);
+    auto [min_trm_csr, med_trm_csr] = time_spmm_t(A_csr, Layout::RowMajor, C_rm);
+    auto [min_trm_csc, med_trm_csc] = time_spmm_t(A_csc, Layout::RowMajor, C_rm);
+    auto [min_trm_coo, med_trm_coo] = time_spmm_t(A_coo, Layout::RowMajor, C_rm);
+
+    // ---- Reference: densify + GEMM, per layout ----
+    // The ColMajor reference (ref_cm) doubles as the correctness oracle.
+    std::vector<T> ref_cm(m * d);
+    auto [min_dens_cm, min_gemm_cm] = run_split_trials(
+        [&]() { rbsd::csr::csr_to_dense(A_csr, Layout::ColMajor, A_dense.data()); },
         [&]() {
-            std::fill(B_right.begin(), B_right.end(), 0.0);
+            std::fill(ref_cm.begin(), ref_cm.end(), 0.0);
             blas::gemm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                       d, n, m, 1.0, A_right.data(), d, S_dense.data(), m, 0.0, B_right.data(), d);
+                       m, d, n, 1.0, A_dense.data(), m, B_cm.data(), n, 0.0, ref_cm.data(), m);
         }, num_trials);
-    long min_ref_right = min_dens + min_gemm_right;
+    long min_ref_cm = min_dens_cm + min_gemm_cm;
 
-    // ---- Correctness: compare each SpMM path against densify + GEMM ----
+    auto [min_dens_rm, min_gemm_rm] = run_split_trials(
+        [&]() { rbsd::csr::csr_to_dense(A_csr, Layout::RowMajor, A_dense.data()); },
+        [&]() {
+            std::fill(C_rm.begin(), C_rm.end(), 0.0);
+            blas::gemm(Layout::RowMajor, Op::NoTrans, Op::NoTrans,
+                       m, d, n, 1.0, A_dense.data(), n, B_rm.data(), d, 0.0, C_rm.data(), d);
+        }, num_trials);
+    long min_ref_rm = min_dens_rm + min_gemm_rm;
+
+    // ---- Correctness: re-run each (format, layout) once, compare to ref_cm ----
     bool all_pass = true;
     int num_checks = 0;
+    std::vector<T> result(m * d);
 
-    auto check = [&](const std::string& label, auto& sparse, auto& dense_in, auto& result,
-                     int64_t r, int64_t c, int64_t k, bool is_left) {
-        // Densify this sparse matrix and compute reference via GEMM
-        std::vector<T> S_dens(m * n);
-        if constexpr (std::is_same_v<std::decay_t<decltype(sparse)>,
-                      RandBLAS::sparse_data::CSRMatrix<T, int64_t>>) {
-            RandBLAS::sparse_data::csr::csr_to_dense(sparse, Layout::ColMajor, S_dens.data());
-        } else if constexpr (std::is_same_v<std::decay_t<decltype(sparse)>,
-                             RandBLAS::sparse_data::CSCMatrix<T, int64_t>>) {
-            RandBLAS::sparse_data::csc::csc_to_dense(sparse, Layout::ColMajor, S_dens.data());
+    // All NoTrans and Trans paths compute the same logical product A*B, so they
+    // are all checked against the single ColMajor oracle ref_cm. For opB=Trans
+    // the dense operand is B^T (== the other layout's buffer; see timing above).
+    auto check = [&](const std::string& label, const auto& A, Layout layout, Op opB) {
+        const T* Bptr;
+        int64_t ldB;
+        if (opB == Op::NoTrans) {
+            Bptr = (layout == Layout::ColMajor) ? B_cm.data() : B_rm.data();
+            ldB  = (layout == Layout::ColMajor) ? n : d;
         } else {
-            RandBLAS::sparse_data::coo::coo_to_dense(sparse, Layout::ColMajor, S_dens.data());
+            Bptr = (layout == Layout::ColMajor) ? B_rm.data() : B_cm.data();
+            ldB  = (layout == Layout::ColMajor) ? d : n;
         }
-
-        std::vector<T> ref(r * c, 0.0);
-        if (is_left) {
-            blas::gemm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                       r, c, k, 1.0, S_dens.data(), m, dense_in.data(), n, 0.0, ref.data(), m);
-        } else {
-            blas::gemm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                       r, c, k, 1.0, dense_in.data(), d, S_dens.data(), m, 0.0, ref.data(), d);
-        }
-
-        // Compute via SpMM and compare
+        int64_t ldC = (layout == Layout::ColMajor) ? m : d;
         std::fill(result.begin(), result.end(), 0.0);
-        if (is_left) {
-            RandBLAS::sparse_data::left_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                r, c, k, 1.0, sparse, 0, 0, dense_in.data(), n, 0.0, result.data(), m);
-        } else {
-            RandBLAS::sparse_data::right_spmm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                r, c, k, 1.0, dense_in.data(), d, sparse, 0, 0, 0.0, result.data(), d);
-        }
-
+        rbsd::left_spmm(layout, Op::NoTrans, opB, m, d, n,
+                        1.0, A, 0, 0, Bptr, ldB, 0.0, result.data(), ldC);
         double maxdiff = 0;
-        for (int64_t i = 0; i < r * c; ++i)
-            maxdiff = std::max(maxdiff, std::abs(result[i] - ref[i]));
+        for (int64_t i = 0; i < m; ++i)
+            for (int64_t j = 0; j < d; ++j) {
+                int64_t idx = (layout == Layout::ColMajor) ? (i + j*m) : (i*d + j);
+                maxdiff = std::max(maxdiff, std::abs(result[idx] - ref_cm[i + j*m]));
+            }
         num_checks++;
         if (maxdiff > 1e-10) {
             std::cout << "  FAIL: " << label << " max|diff|=" << std::scientific << maxdiff << "\n";
@@ -326,32 +355,31 @@ void run_config(int64_t m, int64_t n, int64_t d, double density, int num_trials)
         }
     };
 
-    check("left+CSR",  S_csr, A_left,  B_left,  m, d, n, true);
-    check("left+CSC",  S_csc, A_left,  B_left,  m, d, n, true);
-    check("left+COO",  S_coo, A_left,  B_left,  m, d, n, true);
-    check("right+CSR", S_csr, A_right, B_right, d, n, m, false);
-    check("right+CSC", S_csc, A_right, B_right, d, n, m, false);
-    check("right+COO", S_coo, A_right, B_right, d, n, m, false);
+    check("ColMajor+CSR",      A_csr, Layout::ColMajor, Op::NoTrans);
+    check("ColMajor+CSC",      A_csc, Layout::ColMajor, Op::NoTrans);
+    check("ColMajor+COO",      A_coo, Layout::ColMajor, Op::NoTrans);
+    check("RowMajor+CSR",      A_csr, Layout::RowMajor, Op::NoTrans);
+    check("RowMajor+CSC",      A_csc, Layout::RowMajor, Op::NoTrans);
+    check("RowMajor+COO",      A_coo, Layout::RowMajor, Op::NoTrans);
+    check("ColMajor+CSR(B^T)", A_csr, Layout::ColMajor, Op::Trans);
+    check("ColMajor+CSC(B^T)", A_csc, Layout::ColMajor, Op::Trans);
+    check("ColMajor+COO(B^T)", A_coo, Layout::ColMajor, Op::Trans);
+    check("RowMajor+CSR(B^T)", A_csr, Layout::RowMajor, Op::Trans);
+    check("RowMajor+CSC(B^T)", A_csc, Layout::RowMajor, Op::Trans);
+    check("RowMajor+COO(B^T)", A_coo, Layout::RowMajor, Op::Trans);
 
-    // Also verify hand-rolled CSR correctness
+    // Also verify the hand-rolled CSR path.
     #if defined(RandBLAS_HAS_MKL)
     {
-        std::vector<T> S_dens(m * n);
-        RandBLAS::sparse_data::csr::csr_to_dense(S_csr, Layout::ColMajor, S_dens.data());
-        std::vector<T> ref(m * d, 0.0);
-        blas::gemm(Layout::ColMajor, Op::NoTrans, Op::NoTrans,
-                   m, d, n, 1.0, S_dens.data(), m, A_left.data(), n, 0.0, ref.data(), m);
-
-        std::fill(B_left.begin(), B_left.end(), 0.0);
+        std::fill(result.begin(), result.end(), 0.0);
         handrolled_left_spmm_csr(Layout::ColMajor, m, d, n, 1.0,
-            S_csr, A_left.data(), n, 0.0, B_left.data(), m);
-
+            A_csr, B_cm.data(), n, 0.0, result.data(), m);
         double maxdiff = 0;
         for (int64_t i = 0; i < m * d; ++i)
-            maxdiff = std::max(maxdiff, std::abs(B_left[i] - ref[i]));
+            maxdiff = std::max(maxdiff, std::abs(result[i] - ref_cm[i]));
         num_checks++;
         if (maxdiff > 1e-10) {
-            std::cout << "  FAIL: left+CSR(hand-rolled) max|diff|=" << std::scientific << maxdiff << "\n";
+            std::cout << "  FAIL: ColMajor+CSR(hand-rolled) max|diff|=" << std::scientific << maxdiff << "\n";
             all_pass = false;
         }
     }
@@ -364,62 +392,61 @@ void run_config(int64_t m, int64_t n, int64_t d, double density, int num_trials)
     // ---- Results tables ----
     std::cout << std::fixed << std::setprecision(2);
 
-    // Left SpMM table
+    // ColMajor table
     #if defined(RandBLAS_HAS_MKL)
-    long bl = std::min({min_l_csr, min_l_csr_hr, min_l_csc, min_l_coo});
+    long bcm = std::min({min_cm_csr, min_cm_csr_hr, min_cm_csc, min_cm_coo});
     #else
-    long bl = std::min({min_l_csr, min_l_csc, min_l_coo});
+    long bcm = std::min({min_cm_csr, min_cm_csc, min_cm_coo});
     #endif
-
-    std::cout << "  LEFT SPMM: B(" << m << "x" << d << ") = S * A\n";
-    std::cout << "  " << std::setw(24) << std::left << "Kernel"
-              << std::setw(10) << std::right << "Min (us)"
-              << std::setw(10) << "Med (us)"
-              << std::setw(11) << "vs best" << "\n";
-    std::cout << "  " << std::string(55, '-') << "\n";
-
+    print_table_header("LEFT SPMM, ColMajor dense: C(" + std::to_string(m) + "x" +
+                       std::to_string(d) + ") = A * B   (jik/jki kernels)");
     #if defined(RandBLAS_HAS_MKL)
-    print_row("CSR (MKL)",          min_l_csr,    med_l_csr,    bl);
-    print_row("CSR (hand-rolled)",  min_l_csr_hr, med_l_csr_hr, bl);
-    print_row("CSC (hand-rolled)",  min_l_csc,    med_l_csc,    bl);
-    print_row("COO (MKL)",          min_l_coo,    med_l_coo,    bl);
+    print_row("CSR (MKL)",         min_cm_csr,    med_cm_csr,    bcm);
+    print_row("CSR (hand-rolled)", min_cm_csr_hr, med_cm_csr_hr, bcm);
     #else
-    print_row("CSR (hand-rolled)",  min_l_csr, med_l_csr, bl);
-    print_row("CSC (hand-rolled)",  min_l_csc, med_l_csc, bl);
-    print_row("COO (hand-rolled)",  min_l_coo, med_l_coo, bl);
+    print_row("CSR",               min_cm_csr,    med_cm_csr,    bcm);
     #endif
-    print_densify_row("densify+GEMM", min_ref_left, min_dens, min_gemm_left, bl);
+    print_row("CSC",               min_cm_csc, med_cm_csc, bcm);
+    print_row("COO",               min_cm_coo, med_cm_coo, bcm);
+    print_densify_row("densify+GEMM", min_ref_cm, min_dens_cm, min_gemm_cm, bcm);
     std::cout << "\n";
 
-    // Right SpMM table
-    long br = std::min({min_r_csr, min_r_csc, min_r_coo});
-
-    std::cout << "  RIGHT SPMM: B(" << d << "x" << n << ") = A * S\n";
-    std::cout << "  " << std::setw(24) << std::left << "Kernel"
-              << std::setw(10) << std::right << "Min (us)"
-              << std::setw(10) << "Med (us)"
-              << std::setw(11) << "vs best" << "\n";
-    std::cout << "  " << std::string(55, '-') << "\n";
-
-    #if defined(RandBLAS_HAS_MKL)
-    print_row("CSR (MKL)",          min_r_csr, med_r_csr, br);
-    print_row("CSC (MKL via CSR)",  min_r_csc, med_r_csc, br);
-    print_row("COO (MKL)",          min_r_coo, med_r_coo, br);
-    #else
-    print_row("CSR (hand-rolled)",  min_r_csr, med_r_csr, br);
-    print_row("CSC (hand-rolled)",  min_r_csc, med_r_csc, br);
-    print_row("COO (hand-rolled)",  min_r_coo, med_r_coo, br);
-    #endif
-    print_densify_row("densify+GEMM", min_ref_right, min_dens, min_gemm_right, br);
+    // RowMajor table
+    long brm = std::min({min_rm_csr, min_rm_csc, min_rm_coo});
+    print_table_header("LEFT SPMM, RowMajor dense: C(" + std::to_string(m) + "x" +
+                       std::to_string(d) + ") = A * B   (ikb/kib kernels)");
+    print_row("CSR", min_rm_csr, med_rm_csr, brm);
+    print_row("CSC", min_rm_csc, med_rm_csc, brm);
+    print_row("COO", min_rm_coo, med_rm_coo, brm);
+    print_densify_row("densify+GEMM", min_ref_rm, min_dens_rm, min_gemm_rm, brm);
     std::cout << "\n";
 
-    // Summary: best left vs best right
-    std::cout << "  SUMMARY: best left " << bl << " us  |  best right " << br << " us  |  ";
-    if (bl <= br)
-        std::cout << "left " << std::fixed << std::setprecision(2) << (double)br / bl << "x faster\n";
+    // Transposed-dense tables (opB=Trans -> jik/jki with strided dense access).
+    // MKL declines opB=Trans, so these stay hand-rolled even on MKL builds.
+    long btc = std::min({min_tcm_csr, min_tcm_csc, min_tcm_coo});
+    print_table_header("LEFT SPMM, transposed dense, ColMajor C: C = A * B^T   (opB=Trans -> jik/jki, strided gather)");
+    print_row("CSR", min_tcm_csr, med_tcm_csr, btc);
+    print_row("CSC", min_tcm_csc, med_tcm_csc, btc);
+    print_row("COO", min_tcm_coo, med_tcm_coo, btc);
+    std::cout << "\n";
+
+    long btr = std::min({min_trm_csr, min_trm_csc, min_trm_coo});
+    print_table_header("LEFT SPMM, transposed dense, RowMajor C: C = A * B^T   (opB=Trans -> jik/jki, strided store)");
+    print_row("CSR", min_trm_csr, med_trm_csr, btr);
+    print_row("CSC", min_trm_csc, med_trm_csc, btr);
+    print_row("COO", min_trm_coo, med_trm_coo, btr);
+    std::cout << "\n";
+
+    // Summary: best NoTrans (ColMajor vs RowMajor) and the transposed-dense cost.
+    long bnt = std::min(bcm, brm);
+    long bt  = std::min(btc, btr);
+    std::cout << "  SUMMARY: best NoTrans ColMajor " << bcm << " us  |  best NoTrans RowMajor " << brm << " us  |  ";
+    if (brm <= bcm)
+        std::cout << "RowMajor " << std::fixed << std::setprecision(2) << (double)bcm / brm << "x faster\n";
     else
-        std::cout << "right " << std::fixed << std::setprecision(2) << (double)bl / br << "x faster\n";
-    std::cout << "\n";
+        std::cout << "ColMajor " << std::fixed << std::setprecision(2) << (double)brm / bcm << "x faster\n";
+    std::cout << "           best transposed-dense (opB=Trans) " << bt << " us  ("
+              << std::fixed << std::setprecision(2) << (double)bt / bnt << "x vs best NoTrans)\n\n";
 }
 
 int main(int argc, char** argv) {
@@ -433,9 +460,10 @@ int main(int argc, char** argv) {
     std::cout << "MKL support: DISABLED\n";
 #endif
     std::cout << "\n";
-    std::cout << "  S is m-by-n (sparse), A and B are dense.\n";
-    std::cout << "  Left SpMM:  B(m x d) = S(m x n) * A(n x d)\n";
-    std::cout << "  Right SpMM: B(d x n) = A(d x m) * S(m x n)\n\n";
+    std::cout << "  A is m-by-n (sparse), B and C are dense.\n";
+    std::cout << "  left_spmm:  C(m x d) = A(m x n) * B(n x d)\n";
+    std::cout << "  All kernels are reached through left_spmm; the ColMajor and\n";
+    std::cout << "  RowMajor dense layouts select the two kernel families.\n\n";
 
     if (argc >= 5) {
         // Single config mode
